@@ -744,12 +744,19 @@ class Dehydrator:
             return self._default_episode_analysis()
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
+        index_input = raw_dialogue
+        if len(raw_dialogue) > 6000:
+            index_input = (
+                raw_dialogue[:3000]
+                + "\n...[middle omitted for indexing only]...\n"
+                + raw_dialogue[-3000:]
+            )
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": get_prompt("episode_index")},
-                    {"role": "user", "content": raw_dialogue[:6000]},
+                    {"role": "user", "content": index_input},
                 ],
                 max_tokens=1536,
                 temperature=0.1,

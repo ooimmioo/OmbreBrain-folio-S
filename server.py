@@ -160,13 +160,21 @@ async def breath_hook(request):
         for b in candidates:
             if token_budget <= 0:
                 break
-            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
-            summary_tokens = count_tokens_approx(summary)
-            if summary_tokens > token_budget:
+            if _is_episodic(b):
+                score = decay_engine.calculate_score(b["metadata"])
+                entry = _format_episodic_result(
+                    b,
+                    prefix=f"[权重:{score:.2f}]",
+                    max_tokens=token_budget,
+                )
+            else:
+                entry = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            entry_tokens = count_tokens_approx(entry)
+            if entry_tokens > token_budget:
                 break
-            parts.append(summary)
+            parts.append(entry)
             surfaced_ids.append(b["id"])
-            token_budget -= summary_tokens
+            token_budget -= entry_tokens
 
         # 记"被自动浮现"命中 (SessionStart hook 也是"被想起"的一条路径, 跟 breath() 主路径一致)
         if surfaced_ids:
@@ -217,7 +225,7 @@ async def dream_hook(request):
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
             b for b in all_buckets
-            if b["metadata"].get("type") not in ("permanent", "feel")
+            if b["metadata"].get("type") not in ("permanent", "feel", "episodic")
             and not is_highlighted(b["metadata"])
             and not is_internalized(b["metadata"])
         ]
@@ -331,7 +339,7 @@ def _is_episodic(bucket: dict) -> bool:
     return (bucket.get("metadata") or {}).get("type") == "episodic"
 
 
-def _format_episodic_result(bucket: dict, prefix: str = "") -> str:
+def _format_episodic_result(bucket: dict, prefix: str = "", max_tokens: int = None) -> str:
     meta = bucket.get("metadata") or {}
     raw_dialogue = strip_wikilinks(bucket.get("content") or "")
     header = prefix
@@ -350,7 +358,21 @@ def _format_episodic_result(bucket: dict, prefix: str = "") -> str:
     if meta.get("recall_triggers"):
         index_parts.append("recall_triggers: " + ", ".join(str(t) for t in meta.get("recall_triggers") or []))
     index_block = ("\n" + "\n".join(index_parts)) if index_parts else ""
-    return f"{header}{index_block}\nraw_dialogue:\n{raw_dialogue}"
+    result = f"{header}{index_block}\nraw_dialogue:\n{raw_dialogue}"
+    if max_tokens is None or count_tokens_approx(result) <= max_tokens:
+        return result
+
+    scaffold = f"{header} [truncated]{index_block}\nraw_dialogue:\n"
+    remaining_tokens = max(0, max_tokens - count_tokens_approx(scaffold) - count_tokens_approx("\n[truncated]"))
+    # count_tokens_approx is intentionally rough; use chars ~= tokens*4 and clamp again below.
+    raw_limit = max(0, remaining_tokens * 4)
+    truncated_raw = raw_dialogue[:raw_limit].rstrip()
+    result = f"{scaffold}{truncated_raw}\n[truncated]"
+    while raw_limit > 0 and count_tokens_approx(result) > max_tokens:
+        raw_limit = int(raw_limit * 0.8)
+        truncated_raw = raw_dialogue[:raw_limit].rstrip()
+        result = f"{scaffold}{truncated_raw}\n[truncated]"
+    return result
 
 
 # =============================================================
@@ -1232,7 +1254,7 @@ async def dream() -> str:
     # noise = resolved + importance=1, 用户软删除标记, 不应该被 AI dream 翻出来
     candidates = [
         b for b in all_buckets
-        if b["metadata"].get("type") not in ("permanent", "feel")
+        if b["metadata"].get("type") not in ("permanent", "feel", "episodic")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
         and not (b["metadata"].get("resolved", False) and b["metadata"].get("importance", 5) == 1)
