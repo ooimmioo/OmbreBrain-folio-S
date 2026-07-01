@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import os
 import shutil
 import sys
 import tempfile
+import webbrowser
 from pathlib import Path
 
 import frontmatter
@@ -94,6 +96,87 @@ class CheckRunner:
         print(f"RESULT {passed}/{total} passed")
         return passed == total
 
+    def write_html(self, report_path: Path, details: dict):
+        passed = sum(1 for _, ok, _ in self.results if ok)
+        total = len(self.results)
+        ok_all = passed == total
+        cards = []
+        for name, ok, detail in self.results:
+            cls = "pass" if ok else "fail"
+            label = "PASS" if ok else "FAIL"
+            extra = "" if ok else f"<p>{html.escape(detail)}</p>"
+            cards.append(
+                f'<section class="check {cls}"><strong>{label}</strong>'
+                f"<span>{html.escape(name)}</span>{extra}</section>"
+            )
+
+        raw_dialogue = html.escape(details.get("raw_dialogue", ""))
+        markdown_path = html.escape(str(details.get("markdown_path", "")))
+        buckets_dir = html.escape(str(details.get("buckets_dir", "")))
+        bucket_id = html.escape(str(details.get("bucket_id", "")))
+        passphrase = html.escape(PASSPHRASE)
+        status_text = "全部通过" if ok_all else "有失败项"
+        status_class = "ok" if ok_all else "bad"
+        body = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Episode 验收报告</title>
+  <style>
+    body {{ margin: 0; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; background: #f6f3ee; color: #1f2933; }}
+    main {{ max-width: 980px; margin: 0 auto; padding: 32px 20px 48px; }}
+    h1 {{ margin: 0 0 8px; font-size: 30px; }}
+    .sub {{ color: #657080; margin-bottom: 24px; }}
+    .hero {{ background: #fff; border: 1px solid #e3ded6; border-radius: 8px; padding: 22px; margin-bottom: 18px; }}
+    .badge {{ display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px; font-weight: 700; }}
+    .badge.ok {{ background: #e7f7ed; color: #11683a; }}
+    .badge.bad {{ background: #ffe8e6; color: #9c251d; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }}
+    .check {{ background: #fff; border: 1px solid #e3ded6; border-radius: 8px; padding: 14px 15px; display: flex; flex-direction: column; gap: 6px; }}
+    .check strong {{ font-size: 13px; letter-spacing: .04em; }}
+    .check.pass strong {{ color: #14824d; }}
+    .check.fail strong {{ color: #bd3028; }}
+    .check p {{ margin: 0; color: #8a342e; line-height: 1.45; }}
+    .panel {{ background: #fff; border: 1px solid #e3ded6; border-radius: 8px; padding: 18px; margin-top: 16px; }}
+    .meta {{ display: grid; grid-template-columns: 130px 1fr; gap: 8px 14px; font-size: 14px; }}
+    code, pre {{ font-family: Consolas, "SFMono-Regular", monospace; }}
+    pre {{ white-space: pre-wrap; word-break: break-word; background: #17202a; color: #edf5ff; border-radius: 8px; padding: 16px; overflow: auto; line-height: 1.55; }}
+  </style>
+</head>
+<body>
+<main>
+  <section class="hero">
+    <h1>Episode 验收报告</h1>
+    <div class="sub">本地临时记忆库测试，不连接真实前端，不需要 API key。</div>
+    <div class="badge {status_class}">{status_text} · {passed}/{total}</div>
+  </section>
+
+  <section class="grid">
+    {''.join(cards)}
+  </section>
+
+  <section class="panel">
+    <h2>本次写入</h2>
+    <div class="meta">
+      <div>Bucket ID</div><div><code>{bucket_id}</code></div>
+      <div>测试暗号</div><div>{passphrase}</div>
+      <div>Markdown</div><div><code>{markdown_path}</code></div>
+      <div>Buckets 目录</div><div><code>{buckets_dir}</code></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>raw_dialogue 原文</h2>
+    <pre>{raw_dialogue}</pre>
+  </section>
+</main>
+</body>
+</html>
+"""
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(body, encoding="utf-8")
+
 
 def _unwrap_tool(tool):
     return getattr(tool, "fn", tool)
@@ -104,8 +187,14 @@ def _setup_bucket_dirs(buckets_dir: Path):
         (buckets_dir / rel).mkdir(parents=True, exist_ok=True)
 
 
-async def run_acceptance(buckets_dir: Path, keep: bool) -> bool:
+async def run_acceptance(buckets_dir: Path, keep: bool, report_path: Path | None, open_report: bool) -> bool:
     runner = CheckRunner()
+    details = {
+        "raw_dialogue": RAW_DIALOGUE,
+        "buckets_dir": buckets_dir,
+        "bucket_id": "",
+        "markdown_path": "",
+    }
     _setup_bucket_dirs(buckets_dir)
 
     os.environ["OMBRE_BUCKETS_DIR"] = str(buckets_dir)
@@ -134,6 +223,7 @@ async def run_acceptance(buckets_dir: Path, keep: bool) -> bool:
     try:
         result = await episode(raw_dialogue=RAW_DIALOGUE, importance=8)
         bucket_id = result.split("→", 1)[1].split()[0]
+        details["bucket_id"] = bucket_id
         runner.check(
             "episode() writes a bucket",
             bool(bucket_id),
@@ -152,6 +242,8 @@ async def run_acceptance(buckets_dir: Path, keep: bool) -> bool:
     )
 
     post = frontmatter.load(bucket["path"]) if bucket else None
+    if bucket:
+        details["markdown_path"] = bucket["path"]
     runner.check(
         "Markdown body preserves full raw_dialogue",
         bool(post and post.content == RAW_DIALOGUE and PASSPHRASE in post.content),
@@ -213,7 +305,13 @@ async def run_acceptance(buckets_dir: Path, keep: bool) -> bool:
     if keep:
         print(f"\nKept acceptance buckets at: {buckets_dir}")
 
-    return runner.print_report()
+    ok = runner.print_report()
+    if report_path is not None:
+        runner.write_html(report_path, details)
+        print(f"HTML report: {report_path}")
+        if open_report:
+            webbrowser.open(report_path.resolve().as_uri())
+    return ok
 
 
 def main() -> int:
@@ -229,6 +327,17 @@ def main() -> int:
         action="store_true",
         help="Delete the temporary buckets directory after the run.",
     )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=ROOT / "episode_acceptance_report.html",
+        help="HTML report path. Defaults to episode_acceptance_report.html in the repo root.",
+    )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the HTML report in your default browser.",
+    )
     args = parser.parse_args()
 
     temp_dir = None
@@ -240,7 +349,7 @@ def main() -> int:
 
     try:
         keep = not args.cleanup or args.buckets_dir is not None
-        ok = asyncio.run(run_acceptance(buckets_dir, keep=keep))
+        ok = asyncio.run(run_acceptance(buckets_dir, keep=keep, report_path=args.report, open_report=args.open))
         return 0 if ok else 1
     finally:
         if temp_dir is not None and args.cleanup:

@@ -16,3 +16,4 @@ backup_*/
 *.db
 import_state.json
 AUDIT.md
+episode_acceptance_report.html
