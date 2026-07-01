@@ -335,12 +335,18 @@ class BucketManager:
         content = str(bucket.get("content") or "")
         domain_str = " ".join(meta.get("domain") or [])
         tags_str = " ".join(meta.get("tags") or [])
+        keywords_str = " ".join(meta.get("keywords") or [])
+        recall_triggers_str = " ".join(meta.get("recall_triggers") or [])
+        emotion_str = str(meta.get("emotion") or "")
 
         fields = [
             ("title",   name,       3.0),
             ("domain",  domain_str, 2.5),
             ("tag",     tags_str,   2.0),
             ("summary", summary,    1.5),
+            ("keyword", keywords_str, 2.0),
+            ("trigger", recall_triggers_str, 2.0),
+            ("emotion", emotion_str, 1.0),
             ("content", content,    self.content_weight),
         ]
 
@@ -611,6 +617,9 @@ class BucketManager:
         event_time: str = None,
         created_by: str = None,
         summary: str = None,
+        keywords: list[str] = None,
+        emotion: str = None,
+        recall_triggers: list[str] = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -667,6 +676,12 @@ class BucketManager:
             metadata["highlight"] = True
         if summary:
             metadata["summary"] = str(summary)[:600]
+        if keywords:
+            metadata["keywords"] = [str(k)[:80] for k in keywords if str(k).strip()][:20]
+        if emotion:
+            metadata["emotion"] = str(emotion)[:120]
+        if recall_triggers:
+            metadata["recall_triggers"] = [str(t)[:120] for t in recall_triggers if str(t).strip()][:20]
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -1505,6 +1520,15 @@ class BucketManager:
         # 各字段独立 partial_ratio
         name_raw = fuzz.partial_ratio(query, meta.get("name", "") or "")
         summary_raw = fuzz.partial_ratio(query, meta.get("summary", "") or "")
+        keyword_raw = max(
+            (fuzz.partial_ratio(query, k) for k in meta.get("keywords", []) if k),
+            default=0,
+        )
+        trigger_raw = max(
+            (fuzz.partial_ratio(query, t) for t in meta.get("recall_triggers", []) if t),
+            default=0,
+        )
+        emotion_raw = fuzz.partial_ratio(query, meta.get("emotion", "") or "")
         domain_raw = max(
             (fuzz.partial_ratio(query, d) for d in meta.get("domain", []) if d),
             default=0,
@@ -1524,9 +1548,10 @@ class BucketManager:
         content_score = content_raw * self.content_weight
         # summary 走 bonus 通道,只加分子(权重 1.5),不进分母 → 不稀释其他字段命中
         summary_bonus = summary_raw * 1.5
+        index_bonus = keyword_raw * 2.0 + trigger_raw * 2.0 + emotion_raw * 1.0
 
         weight_sum = 3 + 2.5 + 2 + self.content_weight  # 旧分母,保护已有阈值行为
-        score = (name_score + domain_score + tag_score + content_score + summary_bonus) / (100 * weight_sum)
+        score = (name_score + domain_score + tag_score + content_score + summary_bonus + index_bonus) / (100 * weight_sum)
         # 上限 1.0(summary 命中拉高时可能超 1.0,但分子仍被 100*weight_sum 限制)
         if score > 1.0:
             score = 1.0
@@ -1535,6 +1560,9 @@ class BucketManager:
         matched_in = []
         if name_raw >= self._MATCH_THRESHOLD: matched_in.append("title")
         if summary_raw >= self._MATCH_THRESHOLD: matched_in.append("summary")
+        if keyword_raw >= self._MATCH_THRESHOLD: matched_in.append("keyword")
+        if trigger_raw >= self._MATCH_THRESHOLD: matched_in.append("trigger")
+        if emotion_raw >= self._MATCH_THRESHOLD: matched_in.append("emotion")
         if domain_raw >= self._MATCH_THRESHOLD: matched_in.append("domain")
         if tag_raw >= self._MATCH_THRESHOLD: matched_in.append("tag")
         if content_raw >= self._MATCH_THRESHOLD: matched_in.append("content")
@@ -1545,6 +1573,9 @@ class BucketManager:
             "field_scores": {
                 "title": name_raw,
                 "summary": summary_raw,
+                "keyword": keyword_raw,
+                "trigger": trigger_raw,
+                "emotion": emotion_raw,
                 "domain": domain_raw,
                 "tag": tag_raw,
                 "content": content_raw,

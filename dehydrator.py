@@ -254,6 +254,26 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
   "suggested_name": "简短标题"
 }"""
 
+EPISODIC_ANALYZE_PROMPT = """你是一个情节记忆索引器。请为一段完整对话生成检索索引。
+
+重要原则：
+1. 原始对话会被完整保存为正文；你不能改写、压缩、替代原文。
+2. summary、keywords、emotion、recall_triggers 只用于检索索引。
+3. emotion 只描述这次对话的当下情绪氛围，不要上升为长期人格判断。
+
+输出格式（纯 JSON，无其他内容）：
+{
+  "summary": "80字以内的一句话索引摘要",
+  "keywords": ["关键词1", "关键词2", "关键词3"],
+  "emotion": "这次对话的情绪氛围",
+  "recall_triggers": ["用户未来可能用来想起这段对话的触发词"],
+  "domain": ["主题域1", "主题域2"],
+  "valence": 0.5,
+  "arousal": 0.3,
+  "importance": 5,
+  "suggested_name": "10字以内标题"
+}"""
+
 
 # =============================================================
 # Runtime prompt overrides
@@ -267,6 +287,7 @@ _DEFAULT_PROMPTS = {
     "redehydrate":   REDEHYDRATE_PROMPT,
     "regen_content": REGEN_CONTENT_PROMPT,
     "analyze":       ANALYZE_PROMPT,
+    "episode_index": EPISODIC_ANALYZE_PROMPT,
 }
 
 # --- Upstream prompts (P0luz/Ombre-Brain @ upstream/main) ---
@@ -714,6 +735,36 @@ class Dehydrator:
             return self._default_analysis()
         return self._parse_analysis(raw)
 
+    async def analyze_episode(self, raw_dialogue: str) -> dict:
+        """
+        Generate index metadata for episodic memory without rewriting the raw dialogue.
+        只为情节记忆生成索引字段；原始对话由调用方完整保存。
+        """
+        if not raw_dialogue or not raw_dialogue.strip():
+            return self._default_episode_analysis()
+        if not self.api_available:
+            raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": get_prompt("episode_index")},
+                    {"role": "user", "content": raw_dialogue[:6000]},
+                ],
+                max_tokens=1536,
+                temperature=0.1,
+            )
+            if not response.choices:
+                return self._default_episode_analysis()
+            raw = response.choices[0].message.content or ""
+            if not raw.strip():
+                return self._default_episode_analysis()
+            return self._parse_episode_analysis(raw)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise RuntimeError(f"情节记忆索引失败，请检查 API 连接: {e}") from e
+
     # ---------------------------------------------------------
     # Parse API JSON response with safety checks
     # 解析 API 返回的 JSON，做安全校验
@@ -753,6 +804,49 @@ class Dehydrator:
             "suggested_name": str(result.get("suggested_name", ""))[:20],
         }
 
+    def _parse_episode_analysis(self, raw: str) -> dict:
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+            result = json.loads(cleaned)
+        except (json.JSONDecodeError, IndexError, ValueError):
+            logger.warning(f"Episode index JSON parse failed / JSON 解析失败: {raw[:200]}")
+            return self._default_episode_analysis()
+
+        if not isinstance(result, dict):
+            return self._default_episode_analysis()
+
+        try:
+            valence = max(0.0, min(1.0, float(result.get("valence", 0.5))))
+            arousal = max(0.0, min(1.0, float(result.get("arousal", 0.3))))
+        except (ValueError, TypeError):
+            valence, arousal = 0.5, 0.3
+        try:
+            importance = max(1, min(10, int(result.get("importance", 5))))
+        except (ValueError, TypeError):
+            importance = 5
+
+        def _list(name: str, limit: int) -> list:
+            value = result.get(name) or []
+            if isinstance(value, str):
+                value = [v.strip() for v in value.split(",") if v.strip()]
+            if not isinstance(value, list):
+                return []
+            return [str(v).strip() for v in value if str(v).strip()][:limit]
+
+        return {
+            "summary": str(result.get("summary", ""))[:600],
+            "keywords": _list("keywords", 20),
+            "emotion": str(result.get("emotion", ""))[:120],
+            "recall_triggers": _list("recall_triggers", 20),
+            "domain": _list("domain", 3) or ["未分类"],
+            "valence": valence,
+            "arousal": arousal,
+            "importance": importance,
+            "suggested_name": str(result.get("suggested_name", ""))[:20],
+        }
+
     # ---------------------------------------------------------
     # Default analysis result (empty content or total failure)
     # 默认分析结果（内容为空或完全失败时用）
@@ -767,6 +861,19 @@ class Dehydrator:
             "valence": 0.5,
             "arousal": 0.3,
             "tags": [],
+            "suggested_name": "",
+        }
+
+    def _default_episode_analysis(self) -> dict:
+        return {
+            "summary": "",
+            "keywords": [],
+            "emotion": "",
+            "recall_triggers": [],
+            "domain": ["未分类"],
+            "valence": 0.5,
+            "arousal": 0.3,
+            "importance": 5,
             "suggested_name": "",
         }
 

@@ -327,6 +327,32 @@ async def _merge_or_create(
     return bucket_id, False
 
 
+def _is_episodic(bucket: dict) -> bool:
+    return (bucket.get("metadata") or {}).get("type") == "episodic"
+
+
+def _format_episodic_result(bucket: dict, prefix: str = "") -> str:
+    meta = bucket.get("metadata") or {}
+    raw_dialogue = strip_wikilinks(bucket.get("content") or "")
+    header = prefix
+    if header:
+        header += " "
+    header += f"[episodic] [bucket_id:{bucket['id']}]"
+    if meta.get("event_time") or meta.get("created"):
+        header += f" [{meta.get('event_time') or meta.get('created')}]"
+    index_parts = []
+    if meta.get("summary"):
+        index_parts.append(f"summary: {meta.get('summary')}")
+    if meta.get("keywords"):
+        index_parts.append("keywords: " + ", ".join(str(k) for k in meta.get("keywords") or []))
+    if meta.get("emotion"):
+        index_parts.append(f"emotion: {meta.get('emotion')}")
+    if meta.get("recall_triggers"):
+        index_parts.append("recall_triggers: " + ", ".join(str(t) for t in meta.get("recall_triggers") or []))
+    index_block = ("\n" + "\n".join(index_parts)) if index_parts else ""
+    return f"{header}{index_block}\nraw_dialogue:\n{raw_dialogue}"
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -486,14 +512,18 @@ async def breath(
             if token_budget <= 0:
                 break
             try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                summary_tokens = count_tokens_approx(summary)
-                if summary_tokens > token_budget:
-                    break
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
                 score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                if _is_episodic(b):
+                    entry = _format_episodic_result(b, prefix=f"[权重:{score:.2f}]")
+                else:
+                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                    summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                    entry = f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
+                summary_tokens = count_tokens_approx(entry)
+                if summary_tokens > token_budget:
+                    break
+                dynamic_results.append(entry)
                 surfaced_ids.append(b["id"])
                 token_budget -= summary_tokens
             except Exception as e:
@@ -610,6 +640,17 @@ async def breath(
         if token_used >= max_tokens:
             break
         try:
+            if _is_episodic(bucket):
+                prefix = "[语义关联]" if bucket.get("vector_match") else ""
+                entry = _format_episodic_result(bucket, prefix=prefix)
+                entry_tokens = count_tokens_approx(entry)
+                if token_used + entry_tokens > max_tokens:
+                    break
+                await bucket_mgr.touch(bucket["id"])
+                results.append(entry)
+                token_used += entry_tokens
+                continue
+
             clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
             # --- Memory reconstruction: shift displayed valence by current mood ---
             # --- 记忆重构：根据当前情绪微调展示层 valence（±0.1）---
@@ -649,9 +690,12 @@ async def breath(
                 drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
                 drift_results = []
                 for b in drifted:
-                    clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
+                    if _is_episodic(b):
+                        drift_results.append(_format_episodic_result(b, prefix="[surface_type: random]"))
+                    else:
+                        clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                        summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                        drift_results.append(f"[surface_type: random]\n{summary}")
                 results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
@@ -786,8 +830,96 @@ async def hold(
 
 
 # =============================================================
-# Tool 3: grow — Grow, fragments become memories
-# 工具 3：grow — 生长，一天的碎片长成记忆
+# Tool 3: episode — Store raw dialogue as episodic memory
+# 工具 3：episode — 情节记忆，完整保存原始对话
+# =============================================================
+@mcp.tool()
+async def episode(
+    raw_dialogue: str,
+    summary: str = "",
+    keywords: str = "",
+    emotion: str = "",
+    recall_triggers: str = "",
+    importance: int = 5,
+    event_time: str = "",
+    name: str = "",
+    domain: str = "",
+) -> str:
+    """写入情节记忆。raw_dialogue 会完整保存为正文；summary/keywords/emotion/recall_triggers 只作为索引。不会自动合并，也不会自动内化为长期人格。"""
+    await decay_engine.ensure_started()
+
+    if not raw_dialogue or not raw_dialogue.strip():
+        return "raw_dialogue 为空，无法写入情节记忆。"
+
+    def _split_list(value) -> list[str]:
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return [v.strip() for v in str(value or "").split(",") if v.strip()]
+
+    importance = max(1, min(10, importance))
+
+    try:
+        analysis = await dehydrator.analyze_episode(raw_dialogue)
+    except Exception as e:
+        logger.warning(f"Episodic indexing failed, storing raw dialogue with defaults: {e}")
+        analysis = {
+            "summary": "",
+            "keywords": [],
+            "emotion": "",
+            "recall_triggers": [],
+            "domain": ["未分类"],
+            "valence": 0.5,
+            "arousal": 0.3,
+            "importance": importance,
+            "suggested_name": "",
+        }
+
+    manual_keywords = _split_list(keywords)
+    manual_triggers = _split_list(recall_triggers)
+    manual_domain = _split_list(domain)
+
+    final_summary = (summary or analysis.get("summary") or "").strip()
+    final_keywords = list(dict.fromkeys((analysis.get("keywords") or []) + manual_keywords))
+    final_emotion = (emotion or analysis.get("emotion") or "").strip()
+    final_triggers = list(dict.fromkeys((analysis.get("recall_triggers") or []) + manual_triggers))
+    final_domain = manual_domain or analysis.get("domain") or ["未分类"]
+    final_name = name or analysis.get("suggested_name") or None
+    final_importance = importance if importance != 5 else int(analysis.get("importance") or 5)
+
+    bucket_id = await bucket_mgr.create(
+        content=raw_dialogue.strip(),
+        tags=final_keywords,
+        importance=max(1, min(10, final_importance)),
+        domain=final_domain,
+        valence=analysis.get("valence", 0.5),
+        arousal=analysis.get("arousal", 0.3),
+        name=final_name,
+        bucket_type="episodic",
+        event_time=event_time or None,
+        created_by="ai",
+        summary=final_summary,
+        keywords=final_keywords,
+        emotion=final_emotion,
+        recall_triggers=final_triggers,
+    )
+
+    try:
+        embedding_text = "\n".join([
+            final_summary,
+            " ".join(final_keywords),
+            " ".join(final_triggers),
+            raw_dialogue.strip()[:4000],
+        ]).strip()
+        await embedding_engine.generate_and_store(bucket_id, embedding_text or raw_dialogue.strip())
+    except Exception:
+        pass
+
+    return f"情节记忆已写入→{bucket_id} raw_dialogue 已完整保存"
+
+
+# =============================================================
+# Tool 4: grow — Grow, fragments become memories
+# 工具 4：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
 async def grow(content: str, event_time: str = "") -> str:
@@ -2830,10 +2962,17 @@ async def api_bucket_create(request):
     highlight = bool(body.get("highlight", False))
     internalized = bool(body.get("internalized", False))
     summary = body.get("summary") or None  # 用户在 WriteDrawer 填的"一句话摘要", 漏接 → 写一条记忆摘要永远存不下来
+    keywords = body.get("keywords", [])
+    if isinstance(keywords, str):
+        keywords = [k.strip() for k in keywords.split(",") if k.strip()]
+    emotion = body.get("emotion") or None
+    recall_triggers = body.get("recall_triggers", [])
+    if isinstance(recall_triggers, str):
+        recall_triggers = [t.strip() for t in recall_triggers.split(",") if t.strip()]
     # type 字段 — 用户在 WriteDrawer 切 feel 时前端传 type='feel'
-    # 默认 'dynamic', 合法值: dynamic / feel / permanent
+    # 默认 'dynamic', 合法值: dynamic / feel / permanent / episodic
     bucket_type = body.get("type", "dynamic")
-    if bucket_type not in ("dynamic", "feel", "permanent"):
+    if bucket_type not in ("dynamic", "feel", "permanent", "episodic"):
         bucket_type = "dynamic"
 
     # created_by 可选覆盖 (2026-06-11): 服务端程序化写入 (如分日摘要) 传 'ai' 保持来源标记准确,
@@ -2857,6 +2996,9 @@ async def api_bucket_create(request):
             bucket_type=bucket_type,  # feel 切换时这里写入 metadata.type='feel'
             created_by=created_by,  # 默认 'user' (dashboard 手动新建); 程序化写入可传 'ai'
             summary=summary,
+            keywords=keywords,
+            emotion=emotion,
+            recall_triggers=recall_triggers,
         )
     except Exception as e:
         return JSONResponse({"error": f"create failed: {e}"}, status_code=500)
@@ -2966,6 +3108,9 @@ async def api_search(request):
                 "domain": meta.get("domain", []),
                 "tags": meta.get("tags", []),
                 "summary": meta.get("summary", ""),
+                "keywords": meta.get("keywords", []),
+                "emotion": meta.get("emotion", ""),
+                "recall_triggers": meta.get("recall_triggers", []),
                 "valence": meta.get("valence", 0.5),
                 "arousal": meta.get("arousal", 0.3),
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
@@ -3001,6 +3146,9 @@ async def api_search(request):
                         "domain": vmeta.get("domain", []),
                         "tags": vmeta.get("tags", []),
                         "summary": vmeta.get("summary", ""),
+                        "keywords": vmeta.get("keywords", []),
+                        "emotion": vmeta.get("emotion", ""),
+                        "recall_triggers": vmeta.get("recall_triggers", []),
                         "content_preview": strip_wikilinks(vb.get("content", ""))[:200],
                     })
             except Exception as ve:
@@ -3731,6 +3879,9 @@ async def api_import_results(request):
                 "name": meta.get("name", ""),
                 "content": (b.get("content") or "")[:300],
                 "summary": meta.get("summary", ""),  # 用户编辑过的摘要,空则前端回退到 content 前 160 字
+                "keywords": meta.get("keywords", []),
+                "emotion": meta.get("emotion", ""),
+                "recall_triggers": meta.get("recall_triggers", []),
                 "type": meta.get("type", "dynamic"),
                 "domain": meta.get("domain", []),
                 "tags": meta.get("tags", []),
