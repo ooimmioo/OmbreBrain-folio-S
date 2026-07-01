@@ -3048,6 +3048,56 @@ async def api_bucket_create(request):
     })
 
 
+@mcp.custom_route("/api/episode", methods=["POST"])
+async def api_episode_create(request):
+    """Create episodic memory from browser/front-end callers.
+
+    This endpoint deliberately delegates to the existing episode() MCP tool so
+    browser calls and MCP calls share the same raw-dialogue preservation path.
+    """
+    import re
+    from starlette.responses import JSONResponse
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    raw_dialogue = (body.get("raw_dialogue") or body.get("content") or "").strip()
+    if not raw_dialogue:
+        return JSONResponse({"error": "raw_dialogue is required"}, status_code=400)
+
+    episode_fn = getattr(episode, "fn", episode)
+    try:
+        message = await episode_fn(
+            raw_dialogue=raw_dialogue,
+            summary=body.get("summary") or "",
+            keywords=body.get("keywords") or "",
+            emotion=body.get("emotion") or "",
+            recall_triggers=body.get("recall_triggers") or "",
+            importance=int(body.get("importance", 5)),
+            event_time=body.get("event_time") or "",
+            name=body.get("name") or "",
+            domain=body.get("domain") or "",
+        )
+    except Exception as e:
+        return JSONResponse({"error": f"episode create failed: {e}"}, status_code=500)
+
+    bucket_id = ""
+    match = re.search(r"\b[0-9a-f]{12}\b", str(message))
+    if match:
+        bucket_id = match.group(0)
+
+    fresh = await bucket_mgr.get(bucket_id) if bucket_id else None
+    _invalidate_buckets_cache()
+    return JSONResponse({
+        "ok": bool(bucket_id and fresh),
+        "id": bucket_id,
+        "message": message,
+        "metadata": fresh.get("metadata", {}) if fresh else {},
+    })
+
+
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
     """

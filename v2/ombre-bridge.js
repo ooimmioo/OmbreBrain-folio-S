@@ -154,6 +154,31 @@
     return r.json();
   };
 
+  // Create episodic memory while preserving full raw_dialogue.
+  window.__obCreateEpisode = async function (entry) {
+    entry = entry || {};
+    var raw = (entry.raw_dialogue || entry.rawDialogue || entry.body || '').trim();
+    if (!raw) throw new Error('raw_dialogue is required');
+    var body = {
+      raw_dialogue: raw,
+      summary: entry.summary || '',
+      keywords: entry.keywords || [],
+      emotion: entry.emotion || '',
+      recall_triggers: entry.recall_triggers || entry.recallTriggers || [],
+      importance: entry.importance || 5,
+      event_time: entry.event_time || entry.eventTime || '',
+      name: entry.name || entry.title || '',
+      domain: entry.domain || '',
+    };
+    var r = await fetch('/api/episode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  };
+
   // 全库语义相似(embedding cosine) — modal "可能关联"区用
   window.__obFetchSimilar = async function (id, n) {
     var r = await fetch('/api/bucket/' + encodeURIComponent(id) + '/similar?n=' + (n || 5));
